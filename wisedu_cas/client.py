@@ -133,6 +133,12 @@ class AuthClient:
         self.password = password
         self.totp_secret = totp_secret
         self._totp_provider = totp_provider
+        allowed_auth_methods = {"password", "fido2", "auto"}
+        if auth_method not in allowed_auth_methods:
+            raise ValueError(
+                f"Unsupported auth_method: {auth_method!r}. "
+                f"Expected one of {sorted(allowed_auth_methods)}."
+            )
         self._auth_method: Literal["password", "fido2", "auto"] = auth_method
         self._http_timeout = http_timeout
         self._http_connect_timeout = http_connect_timeout
@@ -182,7 +188,6 @@ class AuthClient:
         # TOTP manual input
         self._totp_pending: bool = False
         self._totp_code: Optional[str] = None
-        self._totp_ready: asyncio.Event = asyncio.Event()
 
         # Restore persisted state
         self._load_state()
@@ -208,7 +213,7 @@ class AuthClient:
         elapsed = time.monotonic() - self._last_login_time
         return elapsed <= self._cookie_ttl
 
-    async def login(self) -> AuthSession:
+    async def login(self, totp_code: Optional[str] = None) -> AuthSession:
         """Execute a fresh CAS login.
 
         Forces the internal state to ``EXPIRED`` so that a new login attempt
@@ -237,9 +242,9 @@ class AuthClient:
         self._transition(AuthState.EXPIRED, "login:force")
         self._last_login_time = 0
 
-        return await self.ensure_logged_in()
+        return await self.ensure_logged_in(totp_code=totp_code)
 
-    async def ensure_logged_in(self) -> AuthSession:
+    async def ensure_logged_in(self, totp_code: Optional[str] = None) -> AuthSession:
         """Ensure an authenticated session exists, reusing or creating as needed.
 
         This is the primary method for routine use. It applies all protection
@@ -266,6 +271,12 @@ class AuthClient:
             ParseError: CAS page changed.
         """
         now = time.monotonic()
+
+        if totp_code is not None:
+            normalized = self._normalize_totp_code(totp_code)
+            if normalized is None:
+                raise TotpRequiredError("Provided totp_code must be a 6-digit number.")
+            self._totp_code = normalized
 
         # Fast path
         if (
@@ -342,8 +353,8 @@ class AuthClient:
     def submit_totp(self, code: str) -> bool:
         """Submit a TOTP code during manual 2FA mode.
 
-        Call this when :class:`TotpRequiredError` is raised and the caller
-        obtains a TOTP code externally (e.g. from a user prompt).
+        Call this after :class:`TotpRequiredError` indicates manual TOTP input
+        is required (e.g. from a user prompt).
 
         Args:
             code: The 6-digit TOTP code.
@@ -353,8 +364,11 @@ class AuthClient:
         """
         if not self._totp_pending:
             return False
-        self._totp_code = code.strip()
-        self._totp_ready.set()
+        normalized = self._normalize_totp_code(code)
+        if normalized is None:
+            logger.warning("event=totp_code_rejected reason=invalid_format")
+            return False
+        self._totp_code = normalized
         logger.info("event=totp_code_submitted")
         return True
 
@@ -749,25 +763,7 @@ class AuthClient:
         )
 
         # Step 2: Obtain TOTP code
-        otp_code: Optional[str] = None
-
-        if self._totp_provider is not None:
-            otp_code = self._totp_provider()
-        elif self.totp_secret:
-            # Auto-generate
-            secret = self._normalize_totp_secret(self.totp_secret)
-            totp = pyotp.TOTP(secret)
-            await _wait_for_stable_totp_window()
-            otp_code = totp.now()
-            logger.info(
-                "event=2fa_totp_generated code=%s**** window_remaining=%ds",
-                otp_code[:2],
-                _totp_window_remaining_seconds(),
-            )
-        else:
-            raise TotpRequiredError(
-                "TOTP 2FA is required but no totp_secret or totp_provider was configured."
-            )
+        otp_code = await self._resolve_totp_code()
 
         if not otp_code:
             raise TotpRequiredError("Failed to obtain TOTP code.")
@@ -841,6 +837,48 @@ class AuthClient:
             raise TotpRequiredError(f"2FA verification failed: {msg}")
 
         logger.info("event=2fa_success")
+
+    async def _resolve_totp_code(self) -> str:
+        """Resolve TOTP code from provider, secret, or manual submission."""
+        if self._totp_provider is not None:
+            code = self._normalize_totp_code(self._totp_provider())
+            if code is None:
+                raise TotpRequiredError("totp_provider returned an invalid code format.")
+            return code
+
+        if self.totp_secret:
+            secret = self._normalize_totp_secret(self.totp_secret)
+            totp = pyotp.TOTP(secret)
+            await _wait_for_stable_totp_window()
+            otp_code = totp.now()
+            normalized = self._normalize_totp_code(otp_code)
+            if normalized is None:
+                raise TotpRequiredError("Generated TOTP code has invalid format.")
+            logger.info(
+                "event=2fa_totp_generated code=%s**** window_remaining=%ds",
+                otp_code[:2],
+                _totp_window_remaining_seconds(),
+            )
+            return normalized
+
+        if self._totp_code is not None:
+            code = self._totp_code
+            self._totp_code = None
+            self._totp_pending = False
+            return code
+
+        self._totp_pending = True
+        raise TotpRequiredError(
+            "TOTP 2FA is required. Prefer configuring totp_secret or totp_provider; "
+            "or call submit_totp(code) and retry login()."
+        )
+
+    @staticmethod
+    def _normalize_totp_code(code: str) -> Optional[str]:
+        normalized = code.strip()
+        if not re.fullmatch(r"\d{6}", normalized):
+            return None
+        return normalized
 
     @staticmethod
     def _normalize_totp_secret(raw: str) -> str:

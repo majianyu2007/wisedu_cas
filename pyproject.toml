@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wisedu_cas"
-version = "0.2.0"
+version = "0.2.1"
 description = "Python client for Wisedu (金智教育) CAS unified authentication"
 readme = "README.md"
-license = "MIT"
+license = {text = "MIT"}
 authors = [
     {name = "majianyu2007"},
 ]
@@ -51,7 +51,8 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-httpx>=0.30",
     "pytest-cov>=5.0",
-    "build>=1.0",
+    "pytest-timeout>=2.3",
+    "build>=1.2",
     "twine>=5.0",
 ]
 
@@ -65,7 +66,5 @@ Changelog = "https://github.com/majianyu2007/wisedu_cas/blob/main/CHANGELOG.md"
 include = ["wisedu_cas*"]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-v --tb=short"
-timeout = 30
