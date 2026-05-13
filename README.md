@@ -29,7 +29,6 @@ automation scripts, and any headless integration that needs authenticated sessio
 - [Security Considerations](#security-considerations)
 - [CAS Compatibility](#cas-compatibility)
 - [Testing](#testing)
-- [Migration Guide](#migration-guide)
 - [FAQ](#faq)
 - [Contributing](#contributing)
 - [License and Disclaimer](#license-and-disclaimer)
@@ -452,51 +451,6 @@ pytest --cov=wisedu_cas --cov-report=term-missing
 | `test_client.py` | `AuthClient` — full login flow, TGC reuse, error classification (JSON and HTML), fast path, circuit breaker integration, rate limiting, single-flight concurrency. |
 
 All tests use `pytest-httpx` to mock HTTP responses. No real campus network is required.
-
----
-
-## Migration Guide
-
-### From NWAFU DeepSeek Proxy (inline login logic)
-
-If you currently use the login logic embedded in `nwafu_deepseek_proxy/server.py`,
-migrate as follows:
-
-**Before (proxy inline):**
-
-```python
-session_mgr = AuthSessionManager()
-client = await session_mgr.ensure_login()
-# ... use client for proxy forwarding
-```
-
-**After (using wisedu_cas):**
-
-```python
-from wisedu_cas import AuthClient
-
-client = AuthClient(
-    auth_server=settings.auth_server,
-    target_service=settings.target_base,
-    username=settings.username,
-    password=settings.password,
-    totp_secret=settings.totp_secret,
-    storage_path="./.data",
-)
-session = await client.ensure_logged_in()
-# session.auth_headers() provides Host + Cookie for forwarding
-```
-
-**Key changes:**
-
-1. `AuthSessionManager` → `AuthClient`.
-2. `ensure_login()` → `ensure_logged_in()`.
-3. `manager._client` → `session._client` (the httpx client is inside `AuthSession`).
-4. `manager.state` → `client.state` (same `AuthState` enum).
-5. Exception names are now importable from `wisedu_cas.exceptions`.
-6. Cookie persistence is automatic when `storage_path` is set.
-7. Encrypted password and TOTP secret are no longer read from env vars inside the
-   library — they are passed explicitly via the constructor.
 
 ---
 

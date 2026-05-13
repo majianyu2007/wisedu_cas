@@ -28,7 +28,6 @@ For English documentation, see [README.md](README.md).
 - [安全建议](#安全建议)
 - [CAS 兼容性](#cas-兼容性)
 - [测试](#测试)
-- [迁移指南](#迁移指南)
 - [FAQ（中文）](#faq中文)
 - [贡献指南](#贡献指南)
 - [许可证与免责声明](#许可证与免责声明)
@@ -417,45 +416,6 @@ pytest --cov=wisedu_cas --cov-report=term-missing
 | `test_client.py` | `AuthClient` —— 完整登录流程、TGC 复用、错误分类（JSON 和 HTML）、快速路径、熔断器集成、频率限制、单飞并发。 |
 
 所有测试使用 `pytest-httpx` 模拟 HTTP 响应，不需要真实校园网络。
-
----
-
-## 迁移指南
-
-### 从 NWAFU DeepSeek Proxy 内联登录逻辑迁移
-
-**迁移前（代理内联）：**
-
-```python
-session_mgr = AuthSessionManager()
-client = await session_mgr.ensure_login()
-```
-
-**迁移后（使用 wisedu_cas）：**
-
-```python
-from wisedu_cas import AuthClient
-
-client = AuthClient(
-    auth_server=settings.auth_server,
-    target_service=settings.target_base,
-    username=settings.username,
-    password=settings.password,
-    totp_secret=settings.totp_secret,
-    storage_path="./.data",
-)
-session = await client.ensure_logged_in()
-```
-
-**关键变更：**
-
-1. `AuthSessionManager` → `AuthClient`。
-2. `ensure_login()` → `ensure_logged_in()`。
-3. `manager._client` → `session._client`（httpx client 在 `AuthSession` 内）。
-4. `manager.state` → `client.state`（相同 `AuthState` 枚举）。
-5. 异常类现可从 `wisedu_cas.exceptions` 导入。
-6. 设置 `storage_path` 后 Cookie 自动持久化。
-7. 加密密码和 TOTP 密钥不再在库内部从环境变量读取——通过构造参数显式传入。
 
 ---
 
