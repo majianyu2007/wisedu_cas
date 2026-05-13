@@ -20,6 +20,7 @@ For English documentation, see [README.md](README.md).
 - [快速开始](#快速开始)
 - [配置项详解](#配置项详解)
 - [TOTP / 二次验证](#totp--二次验证)
+- [FIDO2 / Passkey](#fido2--passkey)
 - [异常模型](#异常模型)
 - [会话生命周期](#会话生命周期)
 - [重试、退避与熔断](#重试退避与熔断)
@@ -54,12 +55,16 @@ For English documentation, see [README.md](README.md).
   仅明确的 CAS 登录重定向（匹配 `auth_server` 主机名）触发重新登录。
   网络错误和上游异常转为 `SUSPECT`，不触发登录风暴。
 - **通用性** — 不硬编码学校域名。`auth_server` 和 `target_service` 均为构造参数。
+- **FIDO2 / Passkey** — 使用预先提取的 ECDSA P-256 凭据进行无密码登录。
+  通过 ``auth_method`` 参数选择，支持 ``"auto"`` 回退模式。
 - **类型安全** — 完整的类型标注，公开 API 全部包含 docstring。
 - **日志脱敏** — 密码、token 和完整 cookie 值不会以明文写入日志。
 
 ### 非目标
 
-- FIDO2 / WebAuthn / Passkey 登录（未来版本的扩展点）。
+- FIDO2 凭据创建 / 设备上 WebAuthn 注册。
+- 从操作系统密钥链或硬件安全密钥中读取 FIDO2 凭据
+  （需要从浏览器 passkey 导出预先提取的凭据文件）。
 - OAuth / OIDC 流程。
 - HTTP 反向代理或请求转发。
 - TOTP 输入 Web UI（库在手动模式下抛出 `TotpRequiredError`，由调用方提供 UI）。
@@ -150,6 +155,28 @@ client = AuthClient(
 session = await client.login()
 ```
 
+使用 FIDO2 passkey：
+
+```python
+from wisedu_cas import AuthClient, Fido2Credential
+
+cred = Fido2Credential(
+    credential_id="a99118bb-...",
+    key_value="MIH...",
+    rp_id="authserver.example.edu.cn",
+    device_binding_id="...",
+)
+client = AuthClient(
+    auth_server="https://authserver.example.edu.cn",
+    target_service="https://target.example.edu.cn",
+    username="your_username",
+    password="your_password",
+    auth_method="fido2",
+    fido2_credential=cred,
+)
+session = await client.login()
+```
+
 日常使用推荐 `ensure_logged_in()`，它会复用现有有效会话：
 
 ```python
@@ -175,6 +202,8 @@ session = await client.ensure_logged_in()
 |------|------|--------|------|
 | `totp_secret` | `str` | `""` | TOTP Base32 密钥。为空且需要二次验证时抛出 `TotpRequiredError`。 |
 | `totp_provider` | `Callable[[], str]` | `None` | 自定义 TOTP 码提供函数（同步），优先级高于 `totp_secret`。 |
+| `auth_method` | `Literal["password","fido2","auto"]` | `"password"` | 认证方法。见 [FIDO2 / Passkey](#fido2--passkey)。 |
+| `fido2_credential` | `Fido2Credential \| None` | `None` | FIDO2 登录凭据。``auth_method`` 为 ``"fido2"`` 时必填。 |
 | `retry_config` | `RetryConfig` | `RetryConfig()` | 自定义保护层参数。 |
 | `storage_path` | `str \| None` | `None` | 持久化限速状态和 Cookie 的目录。`None` 时仅内存。 |
 | `http_timeout` | `float` | `60.0` | HTTP 请求超时（秒）。 |
@@ -231,6 +260,62 @@ client = AuthClient(..., totp_provider=my_totp_provider)
 
 ---
 
+## FIDO2 / Passkey
+
+FIDO2/WebAuthn passkey 登录是密码认证的替代方案。需要**预先提取的凭据**，
+包含 ECDSA P-256 私钥，通常从浏览器 passkey 存储（如 Bitwarden）导出。
+
+### 前提条件
+
+1. 以 JSON 格式导出的 FIDO2 凭据，至少包含：
+   - `credentialId` — 十六进制凭据 ID。
+   - `keyValue` — Base64 编码的 DER 私钥（ECDSA P-256）。
+   - `rpId` — Relying Party ID（AuthServer 主机名）。
+   - `deviceBindingId` — Wisedu AuthServer 的设备绑定 UUID（通过浏览器 FIDO2 注册流程获得）。
+
+2. `cryptography>=42.0.0`（包含在库的 `[dev]` 可选依赖或可单独安装）。
+
+### 使用方式
+
+```python
+from wisedu_cas import AuthClient, Fido2Credential
+
+cred = Fido2Credential.from_dict(json.load(open("credential.json")))
+client = AuthClient(
+    auth_server="https://authserver.example.edu.cn",
+    target_service="https://target.example.edu.cn",
+    username="your_username",
+    password="your_password",  # "auto" 模式下的回退
+    auth_method="fido2",
+    fido2_credential=cred,
+)
+session = await client.login()
+```
+
+### Auto 模式
+
+设置 ``auth_method="auto"`` 时，库优先尝试 FIDO2。若失败（缺凭据、服务器拒
+绝、网络错误），则透明回退至密码 + AES + 可选 TOTP。
+
+| 场景 | FIDO2 结果 | 行为 |
+|------|-----------|------|
+| FIDO2 成功 | 获得 TGC | 返回会话，无需密码。 |
+| 未配置凭据 | `None` | 回退到密码。 |
+| startAssertion 被拒 | `Fido2AssertionError` | 回退到密码。 |
+| 服务器拒绝断言 | 非 302 响应 | 回退到密码。 |
+| 网络错误 | `NetworkError` | 直接传播（带退避/熔断）。 |
+
+所有保护层级（频率限制、退避、熔断器、单飞锁）对 FIDO2 和密码路径同等生效。
+连续的 FIDO2 失败会累加同一失败计数器并可能触发熔断器。
+
+### 安全说明
+
+- 私钥仅在认证期间加载到内存，不会被记录、持久化或传输。
+- 凭据文件应以受限权限存储（``chmod 600``）。
+- 库在本地签名断言，私钥不会离开进程。
+
+---
+
 ## 异常模型
 
 所有库异常继承自 `AuthError`。调用方可捕获 `AuthError` 进行宽泛处理，
@@ -248,6 +333,8 @@ client = AuthClient(..., totp_provider=my_totp_provider)
 | `CircuitOpenError` | 熔断器开启——登录被禁用。 | 等待熔断结束。 |
 | `SessionExpiredError` | 会话不再有效。 | 通过 `ensure_logged_in()` 重新登录。 |
 | `ParseError` | CAS 页面 HTML 结构变化。 | 更新解析器或报告问题。 |
+| `Fido2NotConfiguredError` | 请求 FIDO2 但未配置凭据。 | 提供有效凭据或切换为密码模式。 |
+| `Fido2AssertionError` | 构建或提断言失败。 | 检查凭据有效性；退避后重试。 |
 
 ---
 

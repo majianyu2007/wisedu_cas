@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wisedu_cas"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client for Wisedu (金智教育) CAS unified authentication"
 readme = "README.md"
 license = "MIT"
@@ -20,6 +20,9 @@ keywords = [
     "2fa",
     "golden-wisdom",
     "campus",
+    "fido2",
+    "passkey",
+    "webauthn",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

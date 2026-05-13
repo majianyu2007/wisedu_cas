@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import time
-from typing import Callable, Optional, Tuple
+from typing import Callable, Literal, Optional, Tuple
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import httpx
@@ -25,12 +25,19 @@ from wisedu_cas.exceptions import (
     AuthError,
     CaptchaRequiredError,
     CircuitOpenError,
+    Fido2AssertionError,
+    Fido2NotConfiguredError,
     InvalidCredentialsError,
     LoginBackoffError,
     NetworkError,
     ParseError,
     SessionExpiredError,
     TotpRequiredError,
+)
+from wisedu_cas.fido2 import (
+    Fido2Authenticator,
+    Fido2Credential,
+    extract_execution,
 )
 from wisedu_cas.models import CASFormFields, LoginResult
 from wisedu_cas.parser import (
@@ -73,17 +80,28 @@ class AuthClient:
     and all protection layers (rate limiting, exponential backoff, circuit breaker,
     single-flight lock).
 
+    Supports two authentication methods (see *auth_method*):
+
+    - ``"password"`` (default): AES-encrypted password + optional TOTP 2FA.
+    - ``"fido2"``: FIDO2/WebAuthn passkey login using a pre-extracted credential.
+    - ``"auto"``: Try FIDO2 first; fall back to password on failure.
+
     Args:
         auth_server: Base URL of the Wisedu AuthServer
             (e.g. ``"https://authserver.example.edu.cn"``).
         target_service: Base URL of the target service protected by CAS
             (e.g. ``"https://target.example.edu.cn"``).
         username: CAS login username.
-        password: CAS login password (plain text; never logged).
+        password: CAS login password (plain text; never logged). Required
+            even in ``"fido2"`` mode — used by the Auto mode as a fallback.
         totp_secret: Base32 TOTP secret for 2FA. If omitted and 2FA is required,
             login will raise :class:`TotpRequiredError`.
         totp_provider: Optional callable ``() -> str`` that returns a TOTP
             code synchronously. Takes precedence over *totp_secret* when provided.
+        auth_method: Authentication method: ``"password"``, ``"fido2"``, or
+            ``"auto"`` (default ``"password"``).
+        fido2_credential: A :class:`Fido2Credential` for passkey login.
+            Required when *auth_method* is ``"fido2"``; optional for ``"auto"``.
         retry_config: Optional :class:`RetryConfig` to customize protection parameters.
         storage_path: Optional directory path for persisting login state
             (rate limits, circuit state). If ``None``, all state is in-memory.
@@ -100,6 +118,8 @@ class AuthClient:
         *,
         totp_secret: str = "",
         totp_provider: Optional[Callable[[], str]] = None,
+        auth_method: Literal["password", "fido2", "auto"] = "password",
+        fido2_credential: Optional[Fido2Credential] = None,
         retry_config: Optional[RetryConfig] = None,
         storage_path: Optional[str] = None,
         http_timeout: float = 60.0,
@@ -113,10 +133,21 @@ class AuthClient:
         self.password = password
         self.totp_secret = totp_secret
         self._totp_provider = totp_provider
+        self._auth_method: Literal["password", "fido2", "auto"] = auth_method
         self._http_timeout = http_timeout
         self._http_connect_timeout = http_connect_timeout
         self._login_min_interval = login_min_interval
         self._cookie_ttl = cookie_ttl_seconds
+
+        # FIDO2
+        self._fido2_credential = fido2_credential
+        self._fido2_auth: Optional[Fido2Authenticator] = None
+        if fido2_credential and fido2_credential.is_valid():
+            self._fido2_auth = Fido2Authenticator(
+                auth_server=self.auth_server,
+                username=self.username,
+                credential=fido2_credential,
+            )
 
         self._retry_config = retry_config or RetryConfig()
 
@@ -421,14 +452,23 @@ class AuthClient:
             if self._cookie_path:
                 session.save(self._cookie_path)
             return session
-        except TotpRequiredError:
+        except (TotpRequiredError, Fido2AssertionError) as e:
             self._backoff.consecutive_failures += 1
-            self._transition(AuthState.LOGIN_BACKOFF, "2fa_failed")
+            error_type = "2fa_failed" if isinstance(e, TotpRequiredError) else "fido2_failed"
+            self._transition(AuthState.LOGIN_BACKOFF, error_type)
             if self._backoff.consecutive_failures >= self._retry_config.max_consecutive_failures:
                 self._circuit.open(
                     self._retry_config.circuit_normal_duration,
                     f"consecutive_failures={self._backoff.consecutive_failures}",
                 )
+            self._save_state()
+            raise
+        except Fido2NotConfiguredError as e:
+            self._backoff.consecutive_failures += 1
+            logger.error("event=login_result outcome=failure type=fido2_not_configured error=%s", e)
+            self._circuit.open(
+                self._retry_config.circuit_critical_duration, str(e),
+            )
             self._save_state()
             raise
         except (
@@ -465,8 +505,11 @@ class AuthClient:
             raise
 
     async def _do_login(self) -> AuthSession:
-        """Execute the full CAS login flow."""
-        logger.info("event=login_start target=%s", self.target_service)
+        """Execute the full CAS login flow (password or FIDO2)."""
+        logger.info(
+            "event=login_start target=%s method=%s",
+            self.target_service, self._auth_method,
+        )
 
         if self._session:
             await self._session.close()
@@ -492,7 +535,6 @@ class AuthClient:
             resp = await retry_request(client, "GET", login_url, follow_redirects=False)
 
             if resp.status_code in (301, 302, 307, 308):
-                # Existing TGC cookie — follow redirect chain
                 location = resp.headers.get("location", "")
                 logger.info("Existing TGC detected, following redirect")
                 await self._handle_login_redirect(client, location)
@@ -505,10 +547,18 @@ class AuthClient:
             execution, salt = parse_login_form(resp.text)
             logger.info("Parsed form: salt=%s**** execution=%s...", salt[:4], execution[:20])
 
-            # Step 2: Encrypt password
+            # Step 2: Try FIDO2 if configured
+            if self._auth_method in ("fido2", "auto") and self._fido2_auth is not None:
+                fido2_result = await self._try_fido2_path(client, login_url, execution)
+                if fido2_result is not None:
+                    return fido2_result
+                # fido2 mode: failure is fatal
+                if self._auth_method == "fido2":
+                    raise Fido2AssertionError("FIDO2 login failed")
+
+            # Step 3: Password login (default, or fallback in "auto" mode)
             encrypted_pwd = encrypt_password(self.password, salt)
 
-            # Step 3: Submit login form
             login_data = {
                 "username": self.username,
                 "password": encrypted_pwd,
@@ -559,6 +609,68 @@ class AuthClient:
             except Exception:
                 pass
             raise
+
+    async def _try_fido2_path(
+        self,
+        client: httpx.AsyncClient,
+        login_url: str,
+        execution: str,
+    ) -> Optional[AuthSession]:
+        """Attempt FIDO2 login. Returns a session on success, None on failure.
+
+        Raises:
+            Fido2NotConfiguredError: If no FIDO2 authenticator is available
+                and the auth method is ``"fido2"``.
+            Fido2AssertionError: If any FIDO2 stage fails.
+        """
+        if self._fido2_auth is None:
+            if self._auth_method == "fido2":
+                raise Fido2NotConfiguredError(
+                    "FIDO2 login requested but no valid credential is configured"
+                )
+            return None
+
+        logger.info("event=fido2_attempt")
+        try:
+            resp = await self._fido2_auth.authenticate(client, execution=execution)
+        except (Fido2NotConfiguredError, Fido2AssertionError):
+            if self._auth_method == "auto":
+                logger.info("event=fido2_fallback reason=FIDO2 failed, falling back to password")
+                return None
+            raise
+        except AuthError:
+            if self._auth_method == "auto":
+                logger.info("event=fido2_fallback reason=FIDO2 auth error, falling back to password")
+                return None
+            raise
+        except Exception as e:
+            if self._auth_method == "auto":
+                logger.info("event=fido2_fallback reason=%s, falling back to password", e)
+                return None
+            raise Fido2AssertionError(f"FIDO2 authentication failed: {e}") from e
+
+        if resp.status_code not in (301, 302, 307, 308):
+            err_text = extract_error_text(resp.text) if hasattr(resp, "text") else None
+            msg = (
+                f"FIDO2 assertion rejected by AuthServer"
+                + (f": {err_text}" if err_text else "")
+            )
+            if self._auth_method == "auto":
+                logger.info("event=fido2_fallback reason=%s, falling back to password", msg)
+                return None
+            raise Fido2AssertionError(msg)
+
+        location = resp.headers.get("location", "")
+        logger.info("FIDO2 assertion accepted, following redirect")
+        await self._handle_login_redirect(client, location)
+        await self._validate_session(client)
+
+        logger.info("FIDO2 login complete, session ready")
+        return AuthSession(
+            _client=client,
+            target_service=self.target_service,
+            auth_server=self.auth_server,
+        )
 
     # ---- Redirect following ----
 

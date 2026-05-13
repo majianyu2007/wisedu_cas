@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-05-13
+
+### Added
+- FIDO2/WebAuthn passkey authentication (`wisedu_cas/fido2.py`).
+- `auth_method` parameter on `AuthClient`: `"password"`, `"fido2"`, `"auto"`.
+- `Fido2Credential` data model for pre-extracted ECDSA P-256 credentials.
+- `Fido2Authenticator` orchestrator: startAssertion, assertion building, submission.
+- `Fido2AssertionError` and `Fido2NotConfiguredError` exceptions.
+- `auto` auth mode: try FIDO2 first, transparent fallback to password+TOTP.
+- All protection layers (rate limit, backoff, circuit breaker, single-flight)
+  apply to FIDO2 and auto paths identically.
+- `examples/with_fido2.py` and `examples/auto_auth_method.py`.
+- 16 new pytest tests covering FIDO2 credential model, assertion building,
+  startAssertion, full authenticator flow, AuthClient FIDO2 integration,
+  auto fallback, and circuit breaker interaction.
+
+### Not yet supported
+- FIDO2 credentials from OS keychain or hardware security keys (requires
+  pre-extracted credential file from browser passkey export).
+- FIDO2 + TOTP combined flows (if 2FA is required after passkey login).
+- WebAuthn registration / credential creation on-device.
+
 ## [0.1.0] — 2026-05-13
 
 ### Added

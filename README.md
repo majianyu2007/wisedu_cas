@@ -21,6 +21,7 @@ automation scripts, and any headless integration that needs authenticated sessio
 - [Quick Start](#quick-start)
 - [Configuration Reference](#configuration-reference)
 - [TOTP / 2FA](#totp--2fa)
+- [FIDO2 / Passkey](#fido2--passkey)
 - [Exception Model](#exception-model)
 - [Session Lifecycle](#session-lifecycle)
 - [Retry, Backoff, and Circuit Breaker](#retry-backoff-and-circuit-breaker)
@@ -58,13 +59,17 @@ automation scripts, and any headless integration that needs authenticated sessio
   triggering login storms.
 - **Generic** — no hardcoded school domain. `auth_server` and `target_service`
   are constructor parameters.
+- **FIDO2 / Passkey** — passwordless login using a pre-extracted ECDSA P-256
+  credential. Selectable via ``auth_method`` with ``"auto"`` fallback mode.
 - **Type-safe** — complete type annotations. Public API fully documented with docstrings.
 - **Log sanitisation** — passwords, tokens, and full cookie values are never
   logged in plain text.
 
 ### Non-Goals
 
-- FIDO2 / WebAuthn / Passkey login (extension point for future versions).
+- FIDO2 credential creation / WebAuthn registration on-device.
+- FIDO2 credentials from OS keychain or hardware security keys
+  (requires pre-extracted credential file from a browser passkey export).
 - OAuth / OIDC flows.
 - HTTP reverse proxy or request forwarding.
 - Web UI for TOTP entry (the library raises `TotpRequiredError` for manual mode;
@@ -178,6 +183,28 @@ client = AuthClient(
 session = await client.login()
 ```
 
+With FIDO2 passkey:
+
+```python
+from wisedu_cas import AuthClient, Fido2Credential
+
+cred = Fido2Credential(
+    credential_id="a99118bb-...",
+    key_value="MIH...",
+    rp_id="authserver.example.edu.cn",
+    device_binding_id="...",
+)
+client = AuthClient(
+    auth_server="https://authserver.example.edu.cn",
+    target_service="https://target.example.edu.cn",
+    username="your_username",
+    password="your_password",
+    auth_method="fido2",
+    fido2_credential=cred,
+)
+session = await client.login()
+```
+
 For routine use, prefer `ensure_logged_in()` which reuses an existing valid session:
 
 ```python
@@ -203,6 +230,8 @@ session = await client.ensure_logged_in()
 |-----------|------|---------|-------------|
 | `totp_secret` | `str` | `""` | Base32 TOTP secret for 2FA. If empty and 2FA is required, `TotpRequiredError` is raised. |
 | `totp_provider` | `Callable[[], str]` | `None` | Custom TOTP code provider (synchronous). Takes precedence over `totp_secret`. |
+| `auth_method` | `Literal["password","fido2","auto"]` | `"password"` | Authentication method. See [FIDO2 / Passkey](#fido2--passkey). |
+| `fido2_credential` | `Fido2Credential \| None` | `None` | Credential for FIDO2 login. Required when ``auth_method`` is ``"fido2"``. |
 | `retry_config` | `RetryConfig` | `RetryConfig()` | Custom protection-layer parameters (see below). |
 | `storage_path` | `str \| None` | `None` | Directory for persisting rate-limit state and cookies. In-memory only when `None`. |
 | `http_timeout` | `float` | `60.0` | Total HTTP request timeout (seconds). |
@@ -261,6 +290,71 @@ user for a code, call `client.submit_totp(code)`, then retry `login()`.
 
 ---
 
+## FIDO2 / Passkey
+
+FIDO2/WebAuthn passkey login is available as an alternative to password
+authentication. It requires a **pre-extracted credential** containing an
+ECDSA P-256 private key, typically exported from a browser passkey store
+(e.g. Bitwarden).
+
+### Prerequisites
+
+1. A FIDO2 credential exported as JSON, containing at minimum:
+   - `credentialId` — the hex credential ID.
+   - `keyValue` — the Base64-encoded DER private key (ECDSA P-256).
+   - `rpId` — the Relying Party ID (AuthServer hostname).
+   - `deviceBindingId` — the device-binding UUID for the Wisedu AuthServer
+     (obtained from the browser's FIDO2 registration flow).
+
+2. `cryptography>=42.0.0` (included in the library's optional `[dev]` extras
+   or can be installed separately).
+
+### Usage
+
+```python
+from wisedu_cas import AuthClient, Fido2Credential
+
+cred = Fido2Credential.from_dict(json.load(open("credential.json")))
+client = AuthClient(
+    auth_server="https://authserver.example.edu.cn",
+    target_service="https://target.example.edu.cn",
+    username="your_username",
+    password="your_password",  # fallback in "auto" mode
+    auth_method="fido2",
+    fido2_credential=cred,
+)
+session = await client.login()
+```
+
+### Auto Mode
+
+When ``auth_method="auto"``, the library tries FIDO2 first. If it fails for
+any reason (missing credential, server rejection, network error), it falls
+back transparently to password + AES + optional TOTP.
+
+| Scenario | FIDO2 Result | Behaviour |
+|----------|-------------|-----------|
+| FIDO2 succeeds | TGC obtained | Returns session; no password needed. |
+| No credential configured | `None` | Falls back to password. |
+| startAssertion rejected | `Fido2AssertionError` | Falls back to password. |
+| Assertion rejected by server | non-302 response | Falls back to password. |
+| Network error | `NetworkError` | Propagated as-is (with backoff/circuit). |
+
+All protection layers (rate limiting, backoff, circuit breaker, single-flight)
+apply identically to both FIDO2 and password paths. Consecutive FIDO2 failures
+increment the same failure counter and can open the circuit breaker.
+
+### Security Notes
+
+- The private key is loaded into memory during authentication only. It is
+  never logged, persisted, or transmitted outside the assertion signature.
+- Credential files should be stored with restricted permissions
+  (``chmod 600``).
+- The library signs assertions locally; the private key never leaves the
+  process.
+
+---
+
 ## Exception Model
 
 All library exceptions inherit from `AuthError`. Callers may catch `AuthError`
@@ -278,6 +372,8 @@ for a broad handler or specific subclasses for fine-grained control.
 | `CircuitOpenError` | Circuit breaker open — login disabled. | Wait for circuit to expire. |
 | `SessionExpiredError` | Session no longer valid. | Re-login via `ensure_logged_in()`. |
 | `ParseError` | CAS page HTML structure changed. | Update parser or report issue. |
+| `Fido2NotConfiguredError` | FIDO2 requested but no credential configured. | Provide a valid credential or switch to password. |
+| `Fido2AssertionError` | Building or submitting the assertion failed. | Check credential validity; retry with backoff. |
 
 ---
 

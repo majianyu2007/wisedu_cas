@@ -60,3 +60,11 @@ class SessionExpiredError(AuthError):
 
 class ParseError(AuthError):
     """HTML parsing failed — the CAS login page structure may have changed."""
+
+
+class Fido2NotConfiguredError(AuthError):
+    """FIDO2 authentication was requested but no credential is configured."""
+
+
+class Fido2AssertionError(AuthError):
+    """Building or submitting the WebAuthn assertion failed."""
