@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wisedu_cas"
-version = "1.0.0"
+version = "0.1.0"
 description = "Python client for Wisedu (金智教育) CAS unified authentication"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
-    {name = "majianyu2007", email = "majianyu2007@github.com"},
+    {name = "majianyu2007"},
 ]
 keywords = [
     "wisedu",
@@ -22,9 +22,8 @@ keywords = [
     "campus",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

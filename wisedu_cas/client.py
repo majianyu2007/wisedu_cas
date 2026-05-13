@@ -82,15 +82,13 @@ class AuthClient:
         password: CAS login password (plain text; never logged).
         totp_secret: Base32 TOTP secret for 2FA. If omitted and 2FA is required,
             login will raise :class:`TotpRequiredError`.
-        totp_provider: Optional async callable ``() -> str`` that returns a TOTP
-            code. Takes precedence over *totp_secret* when provided.
+        totp_provider: Optional callable ``() -> str`` that returns a TOTP
+            code synchronously. Takes precedence over *totp_secret* when provided.
         retry_config: Optional :class:`RetryConfig` to customize protection parameters.
         storage_path: Optional directory path for persisting login state
             (rate limits, circuit state). If ``None``, all state is in-memory.
         http_timeout: HTTP request timeout in seconds (default 60).
         http_connect_timeout: HTTP connect timeout in seconds (default 15).
-        logger: Optional :class:`logging.Logger` instance. If ``None``, the
-            module-level logger is used.
     """
 
     def __init__(
@@ -180,26 +178,31 @@ class AuthClient:
         return elapsed <= self._cookie_ttl
 
     async def login(self) -> AuthSession:
-        """Execute a fresh CAS login, bypassing all protection layers.
+        """Execute a fresh CAS login.
 
-        This method always performs a real login attempt, regardless of
-        current state or circuit-breaker status. Callers should prefer
-        :meth:`ensure_logged_in` for routine use.
+        Forces the internal state to ``EXPIRED`` so that a new login attempt
+        is made, then delegates to :meth:`ensure_logged_in`, which applies
+        all active protection layers (rate limiting, backoff, circuit breaker,
+        single-flight lock). If a circuit is already open, the call will still
+        be blocked.
+
+        Callers should prefer :meth:`ensure_logged_in` for routine use;
+        use :meth:`login` only when a fresh authentication is explicitly
+        required (e.g. after credential rotation or session expiry).
 
         Returns:
             An authenticated :class:`AuthSession`.
 
         Raises:
+            CircuitOpenError: Circuit breaker is open.
+            LoginBackoffError: Blocked by rate limit or backoff.
             InvalidCredentialsError: Wrong username/password.
             CaptchaRequiredError: CAS demands a CAPTCHA.
             AccountLockedError: Account is locked.
             TotpRequiredError: 2FA required but not configured.
             NetworkError: Network failure.
             ParseError: CAS page structure changed.
-            CircuitOpenError: Circuit breaker is open (only if state was
-                already CIRCUIT_OPEN before this call — fresh login resets).
         """
-        # Force state to allow login
         self._transition(AuthState.EXPIRED, "login:force")
         self._last_login_time = 0
 

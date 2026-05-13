@@ -3,17 +3,21 @@ wisedu_cas — A Python client library for Wisedu (金智教育) CAS authenticat
 
 Usage::
 
+    import asyncio
     from wisedu_cas import AuthClient
 
-    client = AuthClient(
-        auth_server="https://authserver.example.edu.cn",
-        target_service="https://target.example.edu.cn",
-        username="your_username",
-        password="your_password",
-        totp_secret="BASE32SECRET",  # optional
-    )
-    session = client.login()
-    print(session.cookies_dict())
+    async def main():
+        client = AuthClient(
+            auth_server="https://authserver.example.edu.cn",
+            target_service="https://target.example.edu.cn",
+            username="your_username",
+            password="your_password",
+            totp_secret="BASE32SECRET",  # optional
+        )
+        session = await client.login()
+        print(session.cookies_dict())
+
+    asyncio.run(main())
 
 See the `README.md <https://github.com/majianyu2007/wisedu_cas>`_ for full documentation.
 """
@@ -50,4 +54,4 @@ __all__ = [
     "ParseError",
 ]
 
-__version__ = "1.0.0"
+__version__ = "0.1.0"
