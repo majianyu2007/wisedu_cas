@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-05-13
+
+### Changed
+- Hardened `AuthClient` configuration validation: unsupported `auth_method` now fails fast.
+- Unified TOTP code normalization/validation across provider, generated, and manual submit paths.
+- Implemented manual TOTP waiting flow with bounded timeout and clearer error messaging.
+- Added targeted unit tests for auth method validation, manual TOTP flow, and provider format errors.
+
 ## [0.2.0] — 2026-05-13
 
 ### Added
