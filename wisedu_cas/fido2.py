@@ -21,9 +21,6 @@ from typing import Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
 
 import httpx
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.backends import default_backend
 
 from wisedu_cas.exceptions import Fido2AssertionError, Fido2NotConfiguredError
 
@@ -101,20 +98,14 @@ def _sha256(data: bytes) -> bytes:
 
 # ---- Private key loading ----
 
-def load_private_key(key_value_b64: str) -> ec.EllipticCurvePrivateKey:
+def load_private_key(key_value_b64: str):
     """Parse an ECDSA P-256 private key.
 
     Accepts both standard Base64 and Base64URL encodings.
-
-    Args:
-        key_value_b64: The Base64-encoded DER private key.
-
-    Returns:
-        An :class:`ec.EllipticCurvePrivateKey`.
-
-    Raises:
-        ValueError: If the key cannot be parsed.
     """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+
     try:
         der = base64.b64decode(key_value_b64)
     except Exception:
@@ -201,6 +192,9 @@ def build_webauthn_assertion(
         challenge_b64, credential.rp_id, origin
     )
     auth_data = build_authenticator_data(credential.rp_id, flags=0x1D)
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
 
     signed_data = auth_data + client_data_hash
     try:
