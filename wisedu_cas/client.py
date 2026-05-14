@@ -632,6 +632,16 @@ class AuthClient:
     ) -> Optional[AuthSession]:
         """Attempt FIDO2 login. Returns a session on success, None on failure.
 
+        FIDO2 login is a two-step process:
+        1. Complete passkey authentication on the no-service login page to
+           obtain a TGC (Ticket Granting Cookie).
+        2. Present the TGC to the service-parameter login URL to obtain a
+           service ticket (ST) and follow the redirect chain to the target.
+
+        The *execution* parameter from the service-context login page is NOT
+        used; the FIDO2 authenticator fetches its own execution from the
+        no-service page.
+
         Raises:
             Fido2NotConfiguredError: If no FIDO2 authenticator is available
                 and the auth method is ``"fido2"``.
@@ -645,38 +655,81 @@ class AuthClient:
             return None
 
         logger.info("event=fido2_attempt")
+
+        # Step 1: FIDO2 passkey assertion on the no-service login page.
+        # The server's FIDO form action is /authserver/login (no ?service=).
+        # We must use an execution token from the same no-service context,
+        # so we let the authenticator fetch its own login page rather than
+        # passing the execution from the outer service-context page.
         try:
-            resp = await self._fido2_auth.authenticate(client, execution=execution)
+            resp = await self._fido2_auth.authenticate(
+                client, execution=None
+            )
         except (Fido2NotConfiguredError, Fido2AssertionError):
             if self._auth_method == "auto":
-                logger.info("event=fido2_fallback reason=FIDO2 failed, falling back to password")
+                logger.info(
+                    "event=fido2_fallback reason=FIDO2 failed, falling back to password"
+                )
                 return None
             raise
         except AuthError:
             if self._auth_method == "auto":
-                logger.info("event=fido2_fallback reason=FIDO2 auth error, falling back to password")
+                logger.info(
+                    "event=fido2_fallback "
+                    "reason=FIDO2 auth error, falling back to password"
+                )
                 return None
             raise
         except Exception as e:
             if self._auth_method == "auto":
-                logger.info("event=fido2_fallback reason=%s, falling back to password", e)
+                logger.info(
+                    "event=fido2_fallback reason=%s, falling back to password", e
+                )
                 return None
-            raise Fido2AssertionError(f"FIDO2 authentication failed: {e}") from e
+            raise Fido2AssertionError(
+                f"FIDO2 authentication failed: {e}"
+            ) from e
 
         if resp.status_code not in (301, 302, 307, 308):
-            err_text = extract_error_text(resp.text) if hasattr(resp, "text") else None
+            err_text = (
+                extract_error_text(resp.text) if hasattr(resp, "text") else None
+            )
             msg = (
-                f"FIDO2 assertion rejected by AuthServer"
+                "FIDO2 assertion rejected by AuthServer"
                 + (f": {err_text}" if err_text else "")
             )
             if self._auth_method == "auto":
-                logger.info("event=fido2_fallback reason=%s, falling back to password", msg)
+                logger.info(
+                    "event=fido2_fallback reason=%s, falling back to password", msg
+                )
                 return None
             raise Fido2AssertionError(msg)
 
+        # Follow the TGC redirect chain (no service ticket yet).
         location = resp.headers.get("location", "")
-        logger.info("FIDO2 assertion accepted, following redirect")
-        await self._handle_login_redirect(client, location)
+        logger.info("FIDO2 assertion accepted, following TGC redirect")
+        await self._follow_cas_redirect(client, location)
+
+        # Step 2: Present the TGC to the service-parameter login URL to
+        # obtain a service ticket and follow the redirect to the target.
+        logger.info("FIDO2 step 2: requesting ST via service URL")
+        resp = await retry_request(
+            client, "GET", login_url, follow_redirects=False,
+        )
+        if resp.status_code in (301, 302, 307, 308):
+            location = resp.headers.get("location", "")
+            await self._handle_login_redirect(client, location)
+        else:
+            msg = (
+                f"FIDO2 service-ticket request failed (status {resp.status_code})"
+            )
+            if self._auth_method == "auto":
+                logger.info(
+                    "event=fido2_fallback reason=%s, falling back to password", msg
+                )
+                return None
+            raise Fido2AssertionError(msg)
+
         await self._validate_session(client)
 
         logger.info("FIDO2 login complete, session ready")

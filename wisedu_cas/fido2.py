@@ -326,6 +326,7 @@ async def submit_assertion(
         "cllt": "fidoLogin",
         "dllt": "generalLogin",
         "lt": "",
+        "rememberMe": "true",
         "execution": execution,
     }
     try:
