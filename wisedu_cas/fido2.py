@@ -298,6 +298,7 @@ async def submit_assertion(
     execution: str,
     request_id: str,
     assertion: dict,
+    login_url: Optional[str] = None,
 ) -> httpx.Response:
     """Submit a signed FIDO2 assertion to the CAS login endpoint.
 
@@ -308,6 +309,8 @@ async def submit_assertion(
         execution: The ``execution`` token from the CAS login page.
         request_id: The ``requestId`` from ``startAssertion``.
         assertion: The assertion dict from :func:`build_webauthn_assertion`.
+        login_url: The full login URL to POST to. If ``None``, defaults to
+            ``{auth_server}/authserver/login`` (legacy CAS direct flow).
 
     Returns:
         The HTTP response. A 302/307 indicates success (TGC obtained).
@@ -329,9 +332,10 @@ async def submit_assertion(
         "rememberMe": "true",
         "execution": execution,
     }
+    url = login_url or f"{auth_server}/authserver/login"
     try:
         return await client.post(
-            f"{auth_server}/authserver/login",
+            url,
             data=form,
             follow_redirects=False,
         )
@@ -382,6 +386,7 @@ class Fido2Authenticator:
         self,
         client: httpx.AsyncClient,
         execution: Optional[str] = None,
+        login_url: Optional[str] = None,
     ) -> httpx.Response:
         """Execute the full FIDO2 login flow.
 
@@ -394,6 +399,10 @@ class Fido2Authenticator:
             client: An :class:`httpx.AsyncClient` to use for HTTP requests.
             execution: The execution token from the CAS login page. If ``None``,
                 the login page will be fetched to extract one.
+            login_url: The full login URL to POST the assertion to. If ``None``,
+                defaults to ``{auth_server}/authserver/login`` (legacy CAS flow).
+                When using Vouch Proxy + CAS OIDC, this should be the URL obtained
+                from the Vouch navigation chain.
 
         Returns:
             The HTTP response from the assertion submission. A ``302/307``
@@ -412,7 +421,7 @@ class Fido2Authenticator:
         # Step 1: Obtain execution token
         if execution is None:
             resp = await client.get(
-                f"{self.auth_server}/authserver/login",
+                login_url or f"{self.auth_server}/authserver/login",
                 follow_redirects=False,
             )
             execution = await extract_execution(resp.text)
@@ -442,5 +451,6 @@ class Fido2Authenticator:
             execution,
             request_id,
             assertion,
+            login_url=login_url,
         )
         return resp

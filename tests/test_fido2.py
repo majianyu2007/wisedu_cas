@@ -23,6 +23,7 @@ from wisedu_cas import (
 
 AUTH_SERVER = "https://authserver.example.edu.cn"
 TARGET = "https://target.example.edu.cn"
+VOUCH_HOST = "vouch.nwafu.edu.cn"
 LOGIN_PAGE_HTML = '''
 <html>
 <input type="hidden" id="execution" name="execution" value="exec-fido"/>
@@ -31,6 +32,9 @@ LOGIN_PAGE_HTML = '''
 '''
 
 AUTH_LOGIN_RE = re.compile(r"^https://authserver\.example\.edu\.cn/authserver/login.*")
+TARGET_RE = re.compile(r"^https://target\.example\.edu\.cn")
+VOUCH_RE = re.compile(r"^https://vouch\.nwafu\.edu\.cn")
+OIDC_RE = re.compile(r"^https://authserver\.example\.edu\.cn/authserver/oidc/authorize")
 
 
 # ---- Test helpers ----
@@ -72,6 +76,32 @@ def _start_assertion_json():
             },
         }
     }
+
+
+def mock_vouch_chain(httpx_mock: HTTPXMock, *, login_status=200, login_html=LOGIN_PAGE_HTML):
+    """Set up mock responses for the Vouch → OIDC → CAS redirect chain."""
+    httpx_mock.add_response(
+        url=TARGET_RE, method="GET", status_code=302,
+        headers={"Location": f"https://{VOUCH_HOST}/login?url={TARGET}/"},
+    )
+    httpx_mock.add_response(
+        url=VOUCH_RE, method="GET", status_code=302,
+        headers={"Location": f"{AUTH_SERVER}/authserver/oidc/authorize?client_id=test"},
+    )
+    httpx_mock.add_response(
+        url=OIDC_RE, method="GET", status_code=302,
+        headers={"Location": f"{AUTH_SERVER}/authserver/login?service=oidc_callback"},
+    )
+    if login_status == 302:
+        httpx_mock.add_response(
+            url=AUTH_LOGIN_RE, method="GET", status_code=302,
+            headers={"Location": f"{TARGET}/callback?ticket=ST-xxx"},
+        )
+    else:
+        httpx_mock.add_response(
+            url=AUTH_LOGIN_RE, method="GET", status_code=login_status,
+            html=login_html,
+        )
 
 
 # ---- Credential model tests ----
@@ -188,7 +218,7 @@ class TestParseAssertionOptions:
 class TestFido2AuthenticatorFlow:
     async def test_full_flow_sets_tgc(self, httpx_mock: HTTPXMock) -> None:
         """FIDO2 submission returns 302 → TGC obtained."""
-        # GET login page (no header, no service param)
+        # GET login page (no service param) for execution
         httpx_mock.add_response(
             url=f"{AUTH_SERVER}/authserver/login",
             method="GET",
@@ -215,6 +245,29 @@ class TestFido2AuthenticatorFlow:
         assert resp.status_code == 302
         await client.aclose()
 
+    async def test_full_flow_with_login_url(self, httpx_mock: HTTPXMock) -> None:
+        """FIDO2 with login_url uses that URL instead of default."""
+        custom_login_url = f"{AUTH_SERVER}/authserver/login?service=oidc_callback"
+        # startAssertion
+        httpx_mock.add_response(
+            url=re.compile(r".*/startAssertion$"),
+            method="POST",
+            json=_start_assertion_json(),
+        )
+        # Submit assertion to custom login_url → 302
+        httpx_mock.add_response(
+            url=re.compile(r"^https://authserver\.example\.edu\.cn/authserver/login\?service=oidc_callback$"),
+            method="POST",
+            status_code=302,
+            headers={"Location": f"{AUTH_SERVER}/personalInfo"},
+        )
+
+        auth = Fido2Authenticator(AUTH_SERVER, "testuser", _TEST_CRED)
+        client = httpx.AsyncClient()
+        resp = await auth.authenticate(client, execution="exec-fido", login_url=custom_login_url)
+        assert resp.status_code == 302
+        await client.aclose()
+
     async def test_raises_when_not_configured(self) -> None:
         cred = Fido2Credential("", "", "")
         auth = Fido2Authenticator(AUTH_SERVER, "testuser", cred)
@@ -226,21 +279,11 @@ class TestFido2AuthenticatorFlow:
 
 # ---- AuthClient FIDO2 integration ----
 
-def make_client(**kwargs):
-    defaults = dict(
-        auth_server=AUTH_SERVER,
-        target_service=TARGET,
-        username="testuser",
-        password="testpass",
-    )
-    defaults.update(kwargs)
-    return AuthClient(**defaults)
-
-
 class TestAuthClientFido2:
     async def test_auth_method_fido2_success(self, httpx_mock: HTTPXMock) -> None:
         """Full FIDO2 login via AuthClient."""
-        httpx_mock.add_response(url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML)
+        mock_vouch_chain(httpx_mock)
+        # startAssertion
         httpx_mock.add_response(
             url=re.compile(r".*/startAssertion$"),
             method="POST",
@@ -248,7 +291,7 @@ class TestAuthClientFido2:
         )
         # FIDO2 form submission → 302
         httpx_mock.add_response(
-            url=f"{AUTH_SERVER}/authserver/login",
+            url=AUTH_LOGIN_RE,
             method="POST",
             status_code=302,
             headers={"Location": f"{TARGET}/callback?ticket=ST-xxx"},
@@ -268,7 +311,7 @@ class TestAuthClientFido2:
 
     async def test_auth_method_auto_falls_back_to_password(self, httpx_mock: HTTPXMock) -> None:
         """auto mode: FIDO2 fails → password succeeds."""
-        httpx_mock.add_response(url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML)
+        mock_vouch_chain(httpx_mock)
         httpx_mock.add_response(
             url=re.compile(r".*/startAssertion$"),
             method="POST",
@@ -290,14 +333,14 @@ class TestAuthClientFido2:
 
     async def test_auth_method_fido2_raises_on_rejection(self, httpx_mock: HTTPXMock) -> None:
         """fido2 mode: assertion rejected → Fido2AssertionError."""
-        httpx_mock.add_response(url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML)
+        mock_vouch_chain(httpx_mock)
         httpx_mock.add_response(
             url=re.compile(r".*/startAssertion$"),
             method="POST",
             json=_start_assertion_json(),
         )
         httpx_mock.add_response(
-            url=f"{AUTH_SERVER}/authserver/login",
+            url=AUTH_LOGIN_RE,
             method="POST",
             status_code=200,
             text="<html>Assertion rejected</html>",
@@ -317,14 +360,14 @@ class TestAuthClientFido2:
 
         # 2 failing rounds
         for _ in range(2):
-            httpx_mock.add_response(url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML)
+            mock_vouch_chain(httpx_mock)
             httpx_mock.add_response(
                 url=re.compile(r".*/startAssertion$"),
                 method="POST",
                 json=_start_assertion_json(),
             )
             httpx_mock.add_response(
-                url=f"{AUTH_SERVER}/authserver/login",
+                url=AUTH_LOGIN_RE,
                 method="POST",
                 status_code=200,
                 text="<html>Rejected</html>",
@@ -342,3 +385,14 @@ class TestAuthClientFido2:
         with pytest.raises(CircuitOpenError):
             await client.login()
         await client.close()
+
+
+def make_client(**kwargs) -> AuthClient:
+    defaults = dict(
+        auth_server=AUTH_SERVER,
+        target_service=TARGET,
+        username="testuser",
+        password="testpass",
+    )
+    defaults.update(kwargs)
+    return AuthClient(**defaults)

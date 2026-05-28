@@ -122,9 +122,9 @@ class AuthSession:
             )
             if resp.status_code in (301, 302, 307, 308):
                 location = resp.headers.get("location", "")
-                if _is_cas_login_url(location, self.auth_server):
+                if _is_auth_redirect(location, self.auth_server):
                     raise SessionExpiredError(
-                        f"Session expired: redirected to CAS login at {location[:80]}"
+                        f"Session expired: redirected to auth at {location[:80]}"
                     )
             return True
         except RETRIABLE_NET_ERRORS:
@@ -254,3 +254,23 @@ def _is_cas_login_url(url: str, auth_server: str) -> bool:
     ):
         return True
     return False
+
+
+def _is_vouch_login_url(url: str) -> bool:
+    """Check if *url* is a Vouch Proxy login redirect.
+
+    Returns ``True`` if the URL hostname is ``vouch.nwafu.edu.cn`` and the
+    path starts with ``/login``.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.hostname == "vouch.nwafu.edu.cn" and parsed.path.startswith("/login")
+
+
+def _is_auth_redirect(url: str, auth_server: str) -> bool:
+    """Check if *url* indicates an authentication redirect (CAS login or Vouch Proxy)."""
+    return _is_cas_login_url(url, auth_server) or _is_vouch_login_url(url)

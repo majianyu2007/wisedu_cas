@@ -52,7 +52,7 @@ from wisedu_cas.retry import (
     RetryConfig,
     SingleFlightLock,
 )
-from wisedu_cas.session import AuthSession, _is_cas_login_url
+from wisedu_cas.session import AuthSession, _is_cas_login_url, _is_vouch_login_url, _is_auth_redirect
 from wisedu_cas.state import AuthState
 from wisedu_cas.transport import (
     RETRIABLE_NET_ERRORS,
@@ -518,6 +518,53 @@ class AuthClient:
             self._save_state()
             raise
 
+    async def _navigate_to_login_page(
+        self, client: httpx.AsyncClient
+    ) -> Tuple[str, httpx.Response]:
+        """Navigate through Vouch Proxy → CAS OIDC chain to reach the login page.
+
+        Some deployments use a Vouch Proxy in front of CAS OIDC. The redirect
+        chain is: target → vouch/login → oidc/authorize → CAS login page.
+
+        Returns:
+            A ``(login_url, response)`` tuple where *response* is the CAS
+            login page HTML response.
+
+        Raises:
+            AuthError: If the expected redirect chain is not followed.
+        """
+        # Step 1: Visit target to get Vouch redirect
+        resp = await retry_request(client, "GET", self.target_service, follow_redirects=False)
+        if resp.status_code not in (301, 302, 307, 308):
+            raise AuthError(
+                f"Expected auth redirect from target, got status {resp.status_code}"
+            )
+
+        vouch_url = resp.headers.get("location", "")
+        if not vouch_url:
+            raise AuthError("Target redirect missing Location header")
+
+        # Step 2: Follow to Vouch Proxy
+        resp = await retry_request(client, "GET", vouch_url, follow_redirects=False)
+        if resp.status_code not in (301, 302, 307, 308):
+            raise AuthError(
+                f"Expected OIDC redirect from Vouch, got status {resp.status_code}"
+            )
+
+        oidc_url = resp.headers.get("location", "")
+        # Step 3: Follow to CAS OIDC authorize
+        resp = await retry_request(client, "GET", oidc_url, follow_redirects=False)
+        if resp.status_code not in (301, 302, 307, 308):
+            raise AuthError(
+                f"Expected login redirect from CAS OIDC, got status {resp.status_code}"
+            )
+
+        # Step 4: Get actual CAS login page
+        login_url = resp.headers.get("location", "")
+        logger.info("Navigating to login page: GET %s...", login_url[:80])
+        resp = await retry_request(client, "GET", login_url, follow_redirects=False)
+        return login_url, resp
+
     async def _do_login(self) -> AuthSession:
         """Execute the full CAS login flow (password or FIDO2)."""
         logger.info(
@@ -535,18 +582,8 @@ class AuthClient:
         )
 
         try:
-            # Step 1: Fetch login page
-            service_url = (
-                f"{self.target_service}/.auth/login/cas/callback"
-                f"?return_to={self.target_service}/"
-            )
-            encoded_service = quote(service_url, safe="")
-            login_url = (
-                f"{self.auth_server}/authserver/login"
-                f"?service={encoded_service}"
-            )
-
-            resp = await retry_request(client, "GET", login_url, follow_redirects=False)
+            # Step 1: Navigate to login page (Vouch → OIDC → CAS chain)
+            login_url, resp = await self._navigate_to_login_page(client)
 
             if resp.status_code in (301, 302, 307, 308):
                 location = resp.headers.get("location", "")
@@ -563,7 +600,7 @@ class AuthClient:
 
             # Step 2: Try FIDO2 if configured
             if self._auth_method in ("fido2", "auto") and self._fido2_auth is not None:
-                fido2_result = await self._try_fido2_path(client, login_url, execution)
+                fido2_result = await self._try_fido2_path(client, login_url, execution, resp.text)
                 if fido2_result is not None:
                     return fido2_result
                 # fido2 mode: failure is fatal
@@ -629,18 +666,13 @@ class AuthClient:
         client: httpx.AsyncClient,
         login_url: str,
         execution: str,
+        login_page_html: str,
     ) -> Optional[AuthSession]:
         """Attempt FIDO2 login. Returns a session on success, None on failure.
 
-        FIDO2 login is a two-step process:
-        1. Complete passkey authentication on the no-service login page to
-           obtain a TGC (Ticket Granting Cookie).
-        2. Present the TGC to the service-parameter login URL to obtain a
-           service ticket (ST) and follow the redirect chain to the target.
-
-        The *execution* parameter from the service-context login page is NOT
-        used; the FIDO2 authenticator fetches its own execution from the
-        no-service page.
+        Uses the *login_url* and *execution* obtained from the Vouch → CAS OIDC
+        navigation chain. After passkey authentication, follows the redirect
+        chain through Vouch back to the target service.
 
         Raises:
             Fido2NotConfiguredError: If no FIDO2 authenticator is available
@@ -656,14 +688,10 @@ class AuthClient:
 
         logger.info("event=fido2_attempt")
 
-        # Step 1: FIDO2 passkey assertion on the no-service login page.
-        # The server's FIDO form action is /authserver/login (no ?service=).
-        # We must use an execution token from the same no-service context,
-        # so we let the authenticator fetch its own login page rather than
-        # passing the execution from the outer service-context page.
+        # Use the execution token from the Vouch-navigated login page
         try:
             resp = await self._fido2_auth.authenticate(
-                client, execution=None
+                client, execution=execution, login_url=login_url,
             )
         except (Fido2NotConfiguredError, Fido2AssertionError):
             if self._auth_method == "auto":
@@ -705,30 +733,10 @@ class AuthClient:
                 return None
             raise Fido2AssertionError(msg)
 
-        # Follow the TGC redirect chain (no service ticket yet).
+        # Follow the redirect chain through Vouch back to target
         location = resp.headers.get("location", "")
-        logger.info("FIDO2 assertion accepted, following TGC redirect")
-        await self._follow_cas_redirect(client, location)
-
-        # Step 2: Present the TGC to the service-parameter login URL to
-        # obtain a service ticket and follow the redirect to the target.
-        logger.info("FIDO2 step 2: requesting ST via service URL")
-        resp = await retry_request(
-            client, "GET", login_url, follow_redirects=False,
-        )
-        if resp.status_code in (301, 302, 307, 308):
-            location = resp.headers.get("location", "")
-            await self._handle_login_redirect(client, location)
-        else:
-            msg = (
-                f"FIDO2 service-ticket request failed (status {resp.status_code})"
-            )
-            if self._auth_method == "auto":
-                logger.info(
-                    "event=fido2_fallback reason=%s, falling back to password", msg
-                )
-                return None
-            raise Fido2AssertionError(msg)
+        logger.info("FIDO2 assertion accepted, following redirect chain")
+        await self._handle_login_redirect(client, location)
 
         await self._validate_session(client)
 
@@ -753,8 +761,7 @@ class AuthClient:
             parsed = urlparse(final_url)
             params = parse_qs(parsed.query)
             service_url = params.get("service", [None])[0] or quote(
-                f"{self.target_service}/.auth/login/cas/callback"
-                f"?return_to={self.target_service}/"
+                f"{self.target_service}/"
             )
             await self._complete_2fa(client, service_url)
 
@@ -955,11 +962,11 @@ class AuthClient:
                 headers={"Host": target_host},
                 follow_redirects=False,
             )
-            if resp.status_code in (301, 302, 307):
+            if resp.status_code in (301, 302, 307, 308):
                 location = resp.headers.get("location", "")
-                if _is_cas_login_url(location, self.auth_server):
+                if _is_auth_redirect(location, self.auth_server):
                     raise SessionExpiredError(
-                        f"Session validation failed: redirected to CAS login at {location[:80]}"
+                        f"Session validation failed: redirected to auth at {location[:80]}"
                     )
             logger.info("event=session_validated status=%d", resp.status_code)
         except RETRIABLE_NET_ERRORS as e:

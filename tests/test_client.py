@@ -22,6 +22,7 @@ from wisedu_cas import (
 
 AUTH_SERVER = "https://authserver.example.edu.cn"
 TARGET = "https://target.example.edu.cn"
+VOUCH_HOST = "vouch.nwafu.edu.cn"
 LOGIN_PAGE_HTML = '''
 <html>
 <input type="hidden" id="execution" value="exec-abc"/>
@@ -30,6 +31,9 @@ LOGIN_PAGE_HTML = '''
 '''
 
 AUTH_LOGIN_RE = re.compile(r"^https://authserver\.example\.edu\.cn/authserver/login.*")
+TARGET_RE = re.compile(r"^https://target\.example\.edu\.cn")
+VOUCH_RE = re.compile(r"^https://vouch\.nwafu\.edu\.cn")
+OIDC_RE = re.compile(r"^https://authserver\.example\.edu\.cn/authserver/oidc/authorize")
 
 
 def make_client(**kwargs) -> AuthClient:
@@ -41,6 +45,58 @@ def make_client(**kwargs) -> AuthClient:
     )
     defaults.update(kwargs)
     return AuthClient(**defaults)
+
+
+def mock_vouch_chain(httpx_mock: HTTPXMock, *, login_status=200, login_html=LOGIN_PAGE_HTML):
+    """Set up mock responses for the Vouch → OIDC → CAS redirect chain.
+
+    This simulates the 4-step navigation that _navigate_to_login_page performs:
+      1. GET target → 302 → vouch
+      2. GET vouch → 302 → OIDC authorize
+      3. GET OIDC authorize → 302 → CAS login page
+      4. GET CAS login page → 200 (or 302 if TGC exists)
+
+    Args:
+        httpx_mock: The pytest-httpx mock instance.
+        login_status: Status for the final CAS login page (200 or 302).
+        login_html: HTML body for the login page response.
+    """
+    # Step 1: GET target → 302 → vouch
+    httpx_mock.add_response(
+        url=TARGET_RE,
+        method="GET",
+        status_code=302,
+        headers={"Location": f"https://{VOUCH_HOST}/login?url={TARGET}/"},
+    )
+    # Step 2: GET vouch → 302 → OIDC
+    httpx_mock.add_response(
+        url=VOUCH_RE,
+        method="GET",
+        status_code=302,
+        headers={"Location": f"{AUTH_SERVER}/authserver/oidc/authorize?client_id=test&redirect_uri=https%3A%2F%2Fvouch%2Fauth"},
+    )
+    # Step 3: GET OIDC → 302 → CAS login
+    httpx_mock.add_response(
+        url=OIDC_RE,
+        method="GET",
+        status_code=302,
+        headers={"Location": f"{AUTH_SERVER}/authserver/login?service=oidc_callback"},
+    )
+    # Step 4: GET CAS login page
+    if login_status == 302:
+        httpx_mock.add_response(
+            url=AUTH_LOGIN_RE,
+            method="GET",
+            status_code=302,
+            headers={"Location": f"{TARGET}/callback?ticket=ST-xxx"},
+        )
+    else:
+        httpx_mock.add_response(
+            url=AUTH_LOGIN_RE,
+            method="GET",
+            status_code=login_status,
+            html=login_html,
+        )
 
 
 class TestAuthClientConstruction:
@@ -71,36 +127,22 @@ class TestIsSessionValid:
 class TestLoginSuccess:
     async def test_full_password_login_flow(self, httpx_mock: HTTPXMock) -> None:
         """End-to-end successful password login without 2FA."""
-        # Step 1: GET login page
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE,
-            method="GET",
-            status_code=200,
-            html=LOGIN_PAGE_HTML,
-        )
-        # Step 2: POST login form → 302 to TGC-reuse URL
+        mock_vouch_chain(httpx_mock)
+
+        # POST login form → 302 to 2FA/reauth
         httpx_mock.add_response(
             url=AUTH_LOGIN_RE,
             method="POST",
             status_code=302,
-            headers={
-                "Location": f"{AUTH_SERVER}/authserver/login?service=callback"
-            },
+            headers={"Location": f"{TARGET}/callback?ticket=ST-xxx"},
         )
-        # Step 3: GET TGC-reuse redirect → 302 to target callback with ticket
+        # GET target callback
         httpx_mock.add_response(
-            url=AUTH_LOGIN_RE,
-            method="GET",
-            status_code=302,
-            headers={"Location": f"{TARGET}/.auth/login/cas/callback?ticket=ST-xxx"},
-        )
-        # Step 4: GET target callback with ticket
-        httpx_mock.add_response(
-            url=re.compile(r"^https://target\.example\.edu\.cn/\.auth/login/cas/callback.*"),
+            url=re.compile(r"^https://target\.example\.edu\.cn/callback.*"),
             method="GET",
             status_code=200,
         )
-        # Step 5: HEAD probe for session validation
+        # HEAD probe for session validation
         httpx_mock.add_response(
             url=f"{TARGET}/api/config",
             method="HEAD",
@@ -116,19 +158,14 @@ class TestLoginSuccess:
         await client.close()
 
     async def test_tgc_reuse_flow(self, httpx_mock: HTTPXMock) -> None:
-        """Existing TGC → redirect to callback without form submission."""
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE,
-            method="GET",
-            status_code=302,
-            headers={"Location": f"{TARGET}/callback?ticket=ST-xxx"},
-        )
+        """Existing TGC → redirect chain skips form submission."""
+        mock_vouch_chain(httpx_mock, login_status=302)
+        # Follow redirect to target
         httpx_mock.add_response(
             url=re.compile(r"^https://target\.example\.edu\.cn/callback.*"),
             method="GET",
             status_code=200,
         )
-        # TGC reuse path returns early before _validate_session — no HEAD needed
 
         client = make_client()
         session = await client.login()
@@ -138,9 +175,7 @@ class TestLoginSuccess:
 
 class TestErrorClassification:
     async def test_account_locked_json(self, httpx_mock: HTTPXMock) -> None:
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML,
-        )
+        mock_vouch_chain(httpx_mock)
         httpx_mock.add_response(
             url=AUTH_LOGIN_RE, method="POST", status_code=200, json={"resultCode": "LOCK"},
         )
@@ -151,9 +186,7 @@ class TestErrorClassification:
         await client.close()
 
     async def test_captcha_json(self, httpx_mock: HTTPXMock) -> None:
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML,
-        )
+        mock_vouch_chain(httpx_mock)
         httpx_mock.add_response(
             url=AUTH_LOGIN_RE, method="POST", status_code=200, json={"resultCode": "CAPTCHA_NOTMATCH"},
         )
@@ -164,9 +197,7 @@ class TestErrorClassification:
         await client.close()
 
     async def test_password_error_json(self, httpx_mock: HTTPXMock) -> None:
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML,
-        )
+        mock_vouch_chain(httpx_mock)
         httpx_mock.add_response(
             url=AUTH_LOGIN_RE, method="POST", status_code=200, json={"resultCode": "FAIL_UPNOTMATCH"},
         )
@@ -177,9 +208,7 @@ class TestErrorClassification:
         await client.close()
 
     async def test_locked_from_html_keyword(self, httpx_mock: HTTPXMock) -> None:
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML,
-        )
+        mock_vouch_chain(httpx_mock)
         httpx_mock.add_response(
             url=AUTH_LOGIN_RE, method="POST", status_code=200,
             html="<html>您的账户已被锁定</html>",
@@ -194,15 +223,11 @@ class TestErrorClassification:
 class TestEnsureLoggedInFastPath:
     async def test_returns_session_when_ok(self, httpx_mock: HTTPXMock) -> None:
         """ensure_logged_in returns immediately when state=OK and TTL valid."""
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE, method="GET", status_code=302,
-            headers={"Location": f"{TARGET}/callback?ticket=ST-xxx"},
-        )
+        mock_vouch_chain(httpx_mock, login_status=302)
         httpx_mock.add_response(
             url=re.compile(r"^https://target\.example\.edu\.cn/callback.*"),
             method="GET", status_code=200,
         )
-        # TGC reuse path skips _validate_session; no HEAD needed
 
         client = make_client()
         session1 = await client.login()
@@ -221,9 +246,7 @@ class TestCircuitBreakerIntegration:
             circuit_password_error_duration=1,
         )
 
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML,
-        )
+        mock_vouch_chain(httpx_mock)
         httpx_mock.add_response(
             url=AUTH_LOGIN_RE, method="POST", status_code=200,
             json={"resultCode": "FAIL_UPNOTMATCH"},
@@ -246,10 +269,7 @@ class TestRateLimit:
         retry_cfg = RetryConfig(max_logins_per_hour=1, login_window_seconds=3600)
 
         # First login succeeds
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE, method="GET", status_code=302,
-            headers={"Location": f"{TARGET}/callback?ticket=ST-1"},
-        )
+        mock_vouch_chain(httpx_mock, login_status=302)
         httpx_mock.add_response(
             url=re.compile(r"^https://target\.example\.edu\.cn/callback.*"),
             method="GET", status_code=200,
@@ -258,10 +278,8 @@ class TestRateLimit:
         await client.login()
         await client.close()
 
-        # Second client — already has rate limit recorded, but it's in-memory only.
-        # Actually rate limiter state is in-memory per-instance. Let's use same client.
+        # Second client — pre-record one attempt to hit the limit
         client2 = make_client(retry_config=retry_cfg)
-        # Pre-record one attempt to hit the limit
         client2._rate_limiter.record()
         client2._state = AuthState.EXPIRED
         with pytest.raises(LoginBackoffError):
@@ -272,9 +290,7 @@ class TestRateLimit:
 class TestConcurrentSingleFlight:
     async def test_single_flight_lock(self, httpx_mock: HTTPXMock) -> None:
         """Concurrent calls to ensure_logged_in only trigger one real login."""
-        httpx_mock.add_response(
-            url=AUTH_LOGIN_RE, method="GET", status_code=200, html=LOGIN_PAGE_HTML,
-        )
+        mock_vouch_chain(httpx_mock)
         httpx_mock.add_response(
             url=AUTH_LOGIN_RE, method="POST", status_code=302,
             headers={"Location": f"{TARGET}/callback?ticket=ST-xxx"},
@@ -306,12 +322,11 @@ class TestConcurrentSingleFlight:
 class TestStateTransitions:
     async def test_network_error_to_backoff(self, httpx_mock: HTTPXMock) -> None:
         """Network error during login → LOGIN_BACKOFF state."""
-        # retry_request retries 3 times; need exception mock for each attempt
+        # retry_request retries 3 times; mock all target requests to fail
         for _ in range(3):
             httpx_mock.add_exception(
                 httpx.ConnectError("Connection refused"),
-                url=AUTH_LOGIN_RE,
-                method="GET",
+                url=re.compile(r"^https://target\.example\.edu\.cn"),
             )
 
         client = make_client()

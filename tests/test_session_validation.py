@@ -9,7 +9,7 @@ import pytest
 from pytest_httpx import HTTPXMock
 
 from wisedu_cas.exceptions import SessionExpiredError
-from wisedu_cas.session import AuthSession, _is_cas_login_url
+from wisedu_cas.session import AuthSession, _is_cas_login_url, _is_vouch_login_url, _is_auth_redirect
 
 
 class TestIsCasLoginUrl:
@@ -36,6 +36,46 @@ class TestIsCasLoginUrl:
 
     def test_none_url(self) -> None:
         assert _is_cas_login_url(None, "https://authserver.example.edu.cn") is False  # type: ignore[arg-type]
+
+
+class TestIsVouchLoginUrl:
+    def test_matches_vouch_host(self) -> None:
+        assert _is_vouch_login_url(
+            "https://vouch.nwafu.edu.cn/login?url=https://target.edu.cn/"
+        ) is True
+
+    def test_rejects_different_host(self) -> None:
+        assert _is_vouch_login_url(
+            "https://other.example.com/login"
+        ) is False
+
+    def test_rejects_wrong_path(self) -> None:
+        assert _is_vouch_login_url(
+            "https://vouch.nwafu.edu.cn/auth"
+        ) is False
+
+    def test_empty_url(self) -> None:
+        assert _is_vouch_login_url("") is False
+
+
+class TestIsAuthRedirect:
+    def test_cas_login(self) -> None:
+        assert _is_auth_redirect(
+            "https://authserver.example.edu.cn/authserver/login?service=foo",
+            "https://authserver.example.edu.cn",
+        ) is True
+
+    def test_vouch_redirect(self) -> None:
+        assert _is_auth_redirect(
+            "https://vouch.nwafu.edu.cn/login?url=https://target.edu.cn/",
+            "https://authserver.example.edu.cn",
+        ) is True
+
+    def test_neither(self) -> None:
+        assert _is_auth_redirect(
+            "https://other.example.com/normal/page",
+            "https://authserver.example.edu.cn",
+        ) is False
 
 
 class TestAuthSessionCookies:
@@ -168,6 +208,25 @@ class TestAuthSessionValidate:
             status_code=302,
             headers={
                 "Location": "https://authserver.example.edu.cn/authserver/login?service=x"
+            },
+        )
+        client = httpx.AsyncClient()
+        session = AuthSession(
+            _client=client,
+            target_service="https://target.example.edu.cn",
+            auth_server="https://authserver.example.edu.cn",
+        )
+        with pytest.raises(SessionExpiredError):
+            await session.validate()
+        await client.aclose()
+
+    async def test_validate_detects_vouch_redirect(self, httpx_mock: HTTPXMock) -> None:
+        httpx_mock.add_response(
+            method="HEAD",
+            url="https://target.example.edu.cn/api/config",
+            status_code=302,
+            headers={
+                "Location": "https://vouch.nwafu.edu.cn/login?url=https://target.example.edu.cn/"
             },
         )
         client = httpx.AsyncClient()
